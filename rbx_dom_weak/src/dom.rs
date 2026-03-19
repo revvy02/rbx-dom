@@ -13,7 +13,7 @@ use crate::instance::{Instance, InstanceBuilder};
 ///
 /// When constructing instances, you'll want to create [`InstanceBuilder`]
 /// objects and insert them into the tree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WeakDom {
     instances: AHashMap<Ref, Instance>,
     root_ref: Ref,
