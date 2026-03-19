@@ -159,8 +159,8 @@ impl<'dom> PropInfo<'dom> {
         let current_len = self.values.len();
         let Some(additional) = desired_len.checked_sub(current_len) else {
             panic!(
-                "desired_len ({}) must be greater than or equal to current_len ({})",
-                desired_len, current_len
+                "desired_len ({}) must be greater than or equal to current_len ({}) for property '{}' (serialized as '{}')",
+                desired_len, current_len, self.canonical_name, self.serialized_name
             );
         };
         self.values
@@ -594,6 +594,13 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             else {
                 continue;
             };
+
+            // Multiple property keys can resolve to the same logical property
+            // (e.g. BrickColor and Color both map to Color). If this logical
+            // property already has a value for this instance, skip it.
+            if logical_property.values.len() > desired_len {
+                continue;
+            }
 
             // Discover and track any shared strings we come across.
             push_sstr(prop_value);

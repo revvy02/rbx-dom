@@ -131,6 +131,17 @@ impl InstanceBuilder {
         self.properties.push((key.into(), value.into()));
     }
 
+    /// Set a property on the `InstanceBuilder`, overwriting if it already exists.
+    pub fn set_property<K: Into<Ustr>, V: Into<Variant>>(&mut self, key: K, value: V) {
+        let key = key.into();
+        let value = value.into();
+        if let Some(entry) = self.properties.iter_mut().find(|(k, _)| *k == key) {
+            entry.1 = value;
+        } else {
+            self.properties.push((key, value));
+        }
+    }
+
     /// Check if the `InstanceBuilder` already has a property with the given key.
     pub fn has_property<K: Into<Ustr>>(&self, key: K) -> bool {
         let key = key.into();
@@ -198,7 +209,7 @@ impl InstanceBuilder {
 ///
 /// Operations that could affect other instances contained in the
 /// [`WeakDom`][crate::WeakDom] cannot be performed on an `Instance` correctly.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Instance {
     pub(crate) referent: Ref,
     pub(crate) children: Vec<Ref>,
