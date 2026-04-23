@@ -35,6 +35,15 @@ pub enum MigrationOperation {
     FontToFontFace,
     BrickColorToColor,
     ContentIdToContent,
+    /// Injects the `RBX_LightingTechnologyUnifiedMigration` and
+    /// `RBX_OriginalTechnologyOnFileLoad` attributes onto Lighting instances so
+    /// that Roblox respects the serialized LightingStyle value instead of
+    /// resetting it to Soft via the unified lighting migration.
+    ///
+    /// Unlike the other variants, this migration does not transform the source
+    /// property's value — the source (LightingStyle) continues to serialize as
+    /// itself. The migration only adds entries to the target Attributes property.
+    LightingTechnologyUnifiedMigration,
 }
 
 impl PropertyMigration {
@@ -181,6 +190,35 @@ impl PropertyMigration {
                     })
                 }
             }
+            MigrationOperation::LightingTechnologyUnifiedMigration => {
+                // This migration does not transform the source property's value.
+                // The source property (LightingStyle) keeps serializing as itself.
+                // Attribute injection is handled separately via
+                // `attribute_merge_entries`.
+                Ok(input.clone())
+            }
+        }
+    }
+
+    /// Returns `Some(entries)` for migrations that inject entries into a target
+    /// `Attributes` property during serialization. Returns `None` for
+    /// value-to-value migrations (which are handled by `perform`).
+    ///
+    /// When `Some`, the serializer must:
+    /// - Keep the source property serializing as itself (no redirect).
+    /// - Ensure the target `Attributes` property exists for instances of the
+    ///   class, and merge these entries into it at write time (instance values
+    ///   take precedence on key collision).
+    pub fn attribute_merge_entries(&self) -> Option<Vec<(&'static str, Variant)>> {
+        match self.migration {
+            MigrationOperation::LightingTechnologyUnifiedMigration => Some(vec![
+                (
+                    "RBX_LightingTechnologyUnifiedMigration",
+                    Variant::Bool(true),
+                ),
+                ("RBX_OriginalTechnologyOnFileLoad", Variant::Int32(3)),
+            ]),
+            _ => None,
         }
     }
 }

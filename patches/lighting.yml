@@ -3,3 +3,14 @@ Change:
     ClockTime:
       Serialization:
         Type: Serializes
+    # Roblox's unified lighting migration resets LightingStyle to Soft when
+    # loading files that lack the RBX_LightingTechnologyUnifiedMigration
+    # attribute on Lighting. This migration injects that attribute (and the
+    # related RBX_OriginalTechnologyOnFileLoad) so serialized LightingStyle
+    # values are respected by the engine. LightingStyle itself still
+    # serializes as LightingStyle.
+    LightingStyle:
+      Serialization:
+        Type: Migrate
+        To: Attributes
+        Migration: LightingTechnologyUnifiedMigration

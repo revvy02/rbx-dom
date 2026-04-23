@@ -36,6 +36,13 @@ use super::CompressionType;
 
 static FILE_FOOTER: &[u8] = b"</roblox>";
 
+/// A shared empty `Variant::Attributes` used when the serializer needs to
+/// force-create an `Attributes` `PropInfo` for a class that has attribute-merge
+/// migrations (see `TypeInfo::attribute_merge_entries`) but no instance has its
+/// own `Attributes` value set.
+static EMPTY_ATTRIBUTES_VARIANT: Variant = Variant::Attributes(Attributes::new());
+static ATTRIBUTES_PROP_NAME: &str = "Attributes";
+
 /// Represents all of the state during a single serialization session. A new
 /// `BinarySerializer` object should be created every time we want to serialize
 /// a binary model file.
@@ -101,6 +108,17 @@ struct TypeInfo<'dom, 'db> {
     /// This acts as the key to `self.properties`.  It is None for properties
     /// that do not serialize.
     properties_visited: UstrMap<Option<usize>>,
+
+    /// Entries that must be merged into the `Attributes` property of every
+    /// instance of this class during serialization (populated from any
+    /// `PropertySerialization::Migrate` with
+    /// `PropertyMigration::attribute_merge_entries()` returning `Some`).
+    ///
+    /// Example: Lighting has a migration on `LightingStyle` that injects
+    /// `RBX_LightingTechnologyUnifiedMigration = true` and
+    /// `RBX_OriginalTechnologyOnFileLoad = 3` into Attributes so Roblox does
+    /// not reset LightingStyle to Soft on file load.
+    attribute_merge_entries: Vec<(&'static str, Variant)>,
 }
 
 /// A property on a specific class that our serializer knows about.
@@ -273,6 +291,11 @@ impl<'dom, 'db> TypeInfos<'dom, 'db> {
                 false
             };
 
+            // Walk the class and its superclasses once to collect any
+            // attribute-merge entries defined via Migrate serializations.
+            let attribute_merge_entries =
+                collect_attribute_merge_entries(self.database, class_descriptor);
+
             entry.insert(TypeInfo {
                 type_id,
                 is_service,
@@ -280,6 +303,7 @@ impl<'dom, 'db> TypeInfos<'dom, 'db> {
                 properties: Vec::new(),
                 class_descriptor,
                 properties_visited: UstrMap::new(),
+                attribute_merge_entries,
             });
         }
 
@@ -320,33 +344,47 @@ impl<'db> SerializationInfo<'db> {
                             serialization: PropertySerialization::Migrate(prop_migration),
                         } = &descriptor.kind
                         {
-                            // If the property migrates, we need to look up the
-                            // property it should migrate to and use the reflection
-                            // information of the new property instead of the old
-                            // property, because migrated properties should not
-                            // serialize
-                            //
-                            // Assume that the migration will always be
-                            // directed to a property on the same class.
-                            // This avoids re-walking the superclasses.
-                            let new_descriptors = superclass_descriptor
-                                .properties
-                                .get(prop_migration.new_property_name.as_str())
-                                .and_then(|prop| {
-                                    PropertyDescriptors::new(superclass_descriptor, prop)
-                                });
+                            // Attribute-merge migrations (e.g.
+                            // LightingTechnologyUnifiedMigration) do not replace
+                            // the source property's serialization. The source
+                            // (e.g. LightingStyle) keeps serializing as itself;
+                            // the merge into the target Attributes property
+                            // happens via a separate path (see
+                            // `class_attribute_merges` and the Attributes write
+                            // branch in `write_prop_info`).
+                            if prop_migration.attribute_merge_entries().is_some() {
+                                canonical_name = descriptors.canonical.name.as_ref().into();
+                                descriptor
+                            } else {
+                                // If the property migrates, we need to look up the
+                                // property it should migrate to and use the reflection
+                                // information of the new property instead of the old
+                                // property, because migrated properties should not
+                                // serialize
+                                //
+                                // Assume that the migration will always be
+                                // directed to a property on the same class.
+                                // This avoids re-walking the superclasses.
+                                let new_descriptors = superclass_descriptor
+                                    .properties
+                                    .get(prop_migration.new_property_name.as_str())
+                                    .and_then(|prop| {
+                                        PropertyDescriptors::new(superclass_descriptor, prop)
+                                    });
 
-                            migration = Some(prop_migration);
+                                migration = Some(prop_migration);
 
-                            match new_descriptors {
-                                Some(descriptor) => match descriptor.serialized {
-                                    Some(serialized) => {
-                                        canonical_name = descriptor.canonical.name.as_ref().into();
-                                        serialized
-                                    }
+                                match new_descriptors {
+                                    Some(descriptor) => match descriptor.serialized {
+                                        Some(serialized) => {
+                                            canonical_name =
+                                                descriptor.canonical.name.as_ref().into();
+                                            serialized
+                                        }
+                                        None => return None,
+                                    },
                                     None => return None,
-                                },
-                                None => return None,
+                                }
                             }
                         } else {
                             canonical_name = descriptors.canonical.name.as_ref().into();
@@ -616,6 +654,21 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             logical_property.values.push(prop_value);
         }
 
+        // If the class has attribute-merge migrations (e.g. Lighting), ensure
+        // an `Attributes` PropInfo exists for this type so that the merge
+        // entries get written out even when no instance explicitly sets
+        // `Attributes`.
+        if !type_info.attribute_merge_entries.is_empty() {
+            let attrs_ustr = rbx_dom_weak::ustr(ATTRIBUTES_PROP_NAME);
+            type_info.get_or_create_logical_property(
+                &mut push_sstr,
+                database,
+                instance.class,
+                attrs_ustr,
+                &EMPTY_ATTRIBUTES_VARIANT,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -758,15 +811,27 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                 .properties
                 .binary_search_by_key(&name_ustr, |prop_info| prop_info.canonical_name);
 
+            // Destructure so we can borrow `properties` mutably while keeping
+            // shared access to other fields (e.g. attribute_merge_entries).
+            let TypeInfo {
+                properties,
+                instances,
+                attribute_merge_entries,
+                type_id,
+                ..
+            } = type_info;
+            let attribute_merge_entries: &[(&'static str, Variant)] = attribute_merge_entries;
+            let type_id = *type_id;
+
             let (properties_before_name, properties_after_name) = match name_location {
                 // Split properties at the sort location of "Name"
-                Err(name_insert_index) => type_info.properties.split_at_mut(name_insert_index),
+                Err(name_insert_index) => properties.split_at_mut(name_insert_index),
                 // "Name" logical property exists.  Ignore it.
                 Ok(name_index) => {
                     log::warn!("Name property should not exist in Instance.properties. Use Instance.name instead. Property was ignored.");
 
                     let (properties_before_name, properties_after_name) =
-                        type_info.properties.split_at_mut(name_index);
+                        properties.split_at_mut(name_index);
 
                     // Skip "Name" logical property
                     (properties_before_name, &mut properties_after_name[1..])
@@ -776,7 +841,7 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             for prop_info in properties_before_name {
                 let mut chunk = ChunkBuilder::new(b"PROP", self.serializer.compression);
 
-                chunk.write_le_u32(type_info.type_id)?;
+                chunk.write_le_u32(type_id)?;
                 chunk.write_string(&prop_info.serialized_name)?;
                 chunk.write_u8(prop_info.prop_type as u8)?;
 
@@ -786,8 +851,9 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                     self.dom,
                     &self.id_to_referent,
                     &self.shared_string_ids,
-                    &type_info.instances,
+                    instances,
                     type_name,
+                    attribute_merge_entries,
                 )?;
 
                 chunk.dump(&mut self.output)?;
@@ -797,11 +863,11 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             {
                 let mut chunk = ChunkBuilder::new(b"PROP", self.serializer.compression);
 
-                chunk.write_le_u32(type_info.type_id)?;
+                chunk.write_le_u32(type_id)?;
                 chunk.write_string("Name")?;
                 chunk.write_u8(Type::String as u8)?;
 
-                for &instance in &type_info.instances {
+                for &instance in instances.iter() {
                     chunk.write_string(&instance.name)?;
                 }
 
@@ -811,7 +877,7 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             for prop_info in properties_after_name {
                 let mut chunk = ChunkBuilder::new(b"PROP", self.serializer.compression);
 
-                chunk.write_le_u32(type_info.type_id)?;
+                chunk.write_le_u32(type_id)?;
                 chunk.write_string(&prop_info.serialized_name)?;
                 chunk.write_u8(prop_info.prop_type as u8)?;
 
@@ -821,8 +887,9 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                     self.dom,
                     &self.id_to_referent,
                     &self.shared_string_ids,
-                    &type_info.instances,
+                    instances,
                     type_name,
+                    attribute_merge_entries,
                 )?;
 
                 chunk.dump(&mut self.output)?;
@@ -836,6 +903,7 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                 shared_string_ids: &HashMap<SharedString, u32>,
                 instances: &[&Instance],
                 type_name: &str,
+                attribute_merge_entries: &[(&'static str, Variant)],
             ) -> Result<(), InnerError> {
                 profiling::scope!("serialize property", &prop_info.canonical_name);
                 log::trace!(
@@ -870,6 +938,43 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                     prop_type: format!("{:?}", bad_value.ty()),
                 };
 
+                // If this is the Attributes property for a class that has
+                // attribute-merge migrations (e.g. Lighting), materialize merged
+                // copies of each instance's Attributes value so that the
+                // migration entries are present in the written output. Instance
+                // values take precedence on key collision.
+                let merged_attribute_values: Option<Vec<Variant>> =
+                    if prop_info.canonical_name == ATTRIBUTES_PROP_NAME
+                        && !attribute_merge_entries.is_empty()
+                    {
+                        Some(
+                            prop_info
+                                .values
+                                .iter()
+                                .map(|&value| match value {
+                                    Variant::Attributes(attrs) => {
+                                        let mut merged = attrs.clone();
+                                        for (key, merge_value) in attribute_merge_entries {
+                                            if merged.get(*key).is_none() {
+                                                merged.insert(
+                                                    (*key).to_string(),
+                                                    merge_value.clone(),
+                                                );
+                                            }
+                                        }
+                                        Variant::Attributes(merged)
+                                    }
+                                    // Unexpected type for Attributes property;
+                                    // pass through and let the writer emit the
+                                    // usual type-mismatch error.
+                                    _ => value.clone(),
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
+
                 if let Some(property_migration) = prop_info.migration {
                     let migrated_values: Vec<_> = prop_info
                         .values
@@ -888,6 +993,16 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                         shared_string_ids,
                         prop_info.prop_type,
                         migrated_values.iter().map(Cow::as_ref).enumerate(),
+                        type_mismatch,
+                        invalid_value,
+                    )?;
+                } else if let Some(merged) = &merged_attribute_values {
+                    write_prop_values(
+                        chunk,
+                        id_to_referent,
+                        shared_string_ids,
+                        prop_info.prop_type,
+                        merged.iter().enumerate(),
                         type_mismatch,
                         invalid_value,
                     )?;
@@ -1599,6 +1714,45 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
         Ok(())
     }
 }
+/// Walks `class_descriptor` and its superclasses to collect entries that must
+/// be merged into the `Attributes` property of every serialized instance.
+///
+/// An entry is contributed by any property whose `PropertySerialization` is
+/// `Migrate` with a `PropertyMigration::attribute_merge_entries()` returning
+/// `Some`. The canonical example is `LightingTechnologyUnifiedMigration`.
+fn collect_attribute_merge_entries<'db>(
+    database: &'db ReflectionDatabase<'db>,
+    class_descriptor: Option<&'db ClassDescriptor<'db>>,
+) -> Vec<(&'static str, Variant)> {
+    let mut entries = Vec::new();
+    let Some(mut class) = class_descriptor else {
+        return entries;
+    };
+
+    loop {
+        for property in class.properties.values() {
+            if let PropertyKind::Canonical {
+                serialization: PropertySerialization::Migrate(prop_migration),
+            } = &property.kind
+            {
+                if let Some(merge_entries) = prop_migration.attribute_merge_entries() {
+                    entries.extend(merge_entries);
+                }
+            }
+        }
+
+        match class.superclass.as_ref() {
+            Some(superclass_name) => match database.classes.get(superclass_name.as_ref()) {
+                Some(superclass) => class = superclass,
+                None => break,
+            },
+            None => break,
+        }
+    }
+
+    entries
+}
+
 fn fallback_default_value(rbx_type: VariantType) -> Option<&'static Variant> {
     use std::sync::LazyLock;
     static DEFAULT_STRING: Variant = Variant::String(String::new());

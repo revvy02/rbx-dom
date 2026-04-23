@@ -2,10 +2,49 @@ use std::{borrow::Cow, collections::BTreeMap, io::Write};
 
 use ahash::{HashMap, HashMapExt};
 use rbx_dom_weak::{
-    types::{Ref, SharedString, SharedStringHash, Variant},
+    types::{Attributes, Ref, SharedString, SharedStringHash, Variant},
     WeakDom,
 };
-use rbx_reflection::{PropertyKind, PropertySerialization, ReflectionDatabase};
+use rbx_reflection::{ClassDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase};
+
+static ATTRIBUTES_PROP_NAME: &str = "Attributes";
+
+/// Walks `class_descriptor` and its superclasses to collect entries that must
+/// be merged into the `Attributes` property of every serialized instance of
+/// this class. See `TypeInfo::attribute_merge_entries` in rbx_binary for full
+/// context.
+fn collect_attribute_merge_entries<'db>(
+    database: &'db ReflectionDatabase<'db>,
+    class_name: &str,
+) -> Vec<(&'static str, Variant)> {
+    let mut entries: Vec<(&'static str, Variant)> = Vec::new();
+    let Some(mut class) = database.classes.get(class_name) else {
+        return entries;
+    };
+
+    loop {
+        for property in class.properties.values() {
+            if let PropertyKind::Canonical {
+                serialization: PropertySerialization::Migrate(prop_migration),
+            } = &property.kind
+            {
+                if let Some(merge_entries) = prop_migration.attribute_merge_entries() {
+                    entries.extend(merge_entries);
+                }
+            }
+        }
+
+        match class.superclass.as_ref() {
+            Some(superclass_name) => match database.classes.get(superclass_name.as_ref()) {
+                Some(superclass) => class = superclass as &ClassDescriptor<'db>,
+                None => break,
+            },
+            None => break,
+        }
+    }
+
+    entries
+}
 
 use crate::{
     conversion::ConvertVariant,
@@ -190,6 +229,17 @@ fn serialize_instance<'dom, W: Write>(
     property_buffer.extend(instance.properties.iter().map(|(k, v)| (k.as_str(), v)));
     property_buffer.sort_unstable_by_key(|(key, _)| *key);
 
+    // Collect any attribute-merge entries defined by Migrate serializations on
+    // this class (e.g. LightingTechnologyUnifiedMigration). When non-empty, we
+    // ensure these are present in the written Attributes property; if the
+    // instance has no Attributes, we emit one containing just these entries.
+    let attribute_merge_entries = if state.options.use_reflection() {
+        collect_attribute_merge_entries(state.options.database, &instance.class)
+    } else {
+        Vec::new()
+    };
+    let mut attributes_emitted = false;
+
     for (property_name, value) in property_buffer.drain(..) {
         let maybe_serialized_descriptor = if state.options.use_reflection() {
             find_serialized_property_descriptor(
@@ -226,15 +276,45 @@ fn serialize_instance<'dom, W: Write>(
                 serialization: PropertySerialization::Migrate(migration),
             } = &serialized_descriptor.kind
             {
-                // If the migration fails, there's no harm in us doing nothing
-                // since old values will still load in Studio.
-                if let Ok(new_value) = migration.perform(&converted_value) {
-                    converted_value = Cow::Owned(new_value);
-                    serialized_name = &migration.new_property_name
+                // Attribute-merge migrations don't replace the source
+                // property's serialization; they only cause entries to be
+                // merged into the class's Attributes property. Leave the
+                // source (e.g. LightingStyle) serializing as itself.
+                if migration.attribute_merge_entries().is_none() {
+                    // If the migration fails, there's no harm in us doing nothing
+                    // since old values will still load in Studio.
+                    if let Ok(new_value) = migration.perform(&converted_value) {
+                        converted_value = Cow::Owned(new_value);
+                        serialized_name = &migration.new_property_name
+                    }
                 }
             }
 
-            write_value_xml(writer, state, serialized_name, &converted_value)?;
+            // Merge attribute-merge entries into the Attributes property if
+            // this class defines any. Instance values take precedence.
+            let merged_attributes_value;
+            let value_to_write: &Variant = if serialized_name == ATTRIBUTES_PROP_NAME
+                && !attribute_merge_entries.is_empty()
+            {
+                attributes_emitted = true;
+                if let Variant::Attributes(attrs) = converted_value.as_ref() {
+                    let mut merged = attrs.clone();
+                    for (key, merge_value) in &attribute_merge_entries {
+                        if merged.get(*key).is_none() {
+                            merged.insert((*key).to_string(), merge_value.clone());
+                        }
+                    }
+                    merged_attributes_value = Variant::Attributes(merged);
+                    &merged_attributes_value
+                } else {
+                    // Unexpected type; let the writer handle it.
+                    converted_value.as_ref()
+                }
+            } else {
+                converted_value.as_ref()
+            };
+
+            write_value_xml(writer, state, serialized_name, value_to_write)?;
         } else {
             match state.options.property_behavior {
                 EncodePropertyBehavior::IgnoreUnknown => {}
@@ -252,6 +332,22 @@ fn serialize_instance<'dom, W: Write>(
                 }
             }
         }
+    }
+
+    // If this class has attribute-merge entries but no Attributes property was
+    // emitted (instance had no Attributes), synthesize one so the required
+    // entries still make it into the output.
+    if !attribute_merge_entries.is_empty() && !attributes_emitted {
+        let mut synthesized = Attributes::new();
+        for (key, merge_value) in &attribute_merge_entries {
+            synthesized.insert((*key).to_string(), merge_value.clone());
+        }
+        write_value_xml(
+            writer,
+            state,
+            ATTRIBUTES_PROP_NAME,
+            &Variant::Attributes(synthesized),
+        )?;
     }
 
     writer.write(XmlWriteEvent::end_element())?;

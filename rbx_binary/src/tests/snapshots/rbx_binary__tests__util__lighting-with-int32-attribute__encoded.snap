@@ -25,7 +25,7 @@ chunks:
       prop_name: AttributesSerialize
       prop_type: String
       values:
-        - "\u0001\u0000\u0000\u0000 \u0000\u0000\u0000RBX_OriginalTechnologyOnFileLoad\u0004\u0003\u0000\u0000\u0000"
+        - "\u0002\u0000\u0000\u0000&\u0000\u0000\u0000RBX_LightingTechnologyUnifiedMigration\u0003\u0001 \u0000\u0000\u0000RBX_OriginalTechnologyOnFileLoad\u0004\u0003\u0000\u0000\u0000"
   - Prop:
       type_id: 0
       prop_name: Brightness
@@ -166,4 +166,3 @@ chunks:
         - - 0
           - -1
   - End
-
