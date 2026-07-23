@@ -76,7 +76,7 @@ pub mod text_format {
 }
 
 pub use crate::{
-    deserializer::{Deserializer, Error as DecodeError},
+    deserializer::{DecodeInstance, DecodeTarget, Deserializer, Error as DecodeError},
     serializer::{CompressionType, Error as EncodeError, Serializer},
 };
 

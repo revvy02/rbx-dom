@@ -10,7 +10,7 @@ use rbx_dom_weak::{
         SharedString, Tags, UDim, UDim2, UniqueId, Variant, VariantType, Vector2, Vector3,
         Vector3int16,
     },
-    InstanceBuilder, Ustr, WeakDom,
+    Ustr,
 };
 use rbx_reflection::{ClassDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase};
 
@@ -20,18 +20,17 @@ use crate::{
     types::Type,
 };
 
-use super::{error::InnerError, header::FileHeader, Deserializer};
+use super::{error::InnerError, header::FileHeader, DecodeInstance, DecodeTarget, Deserializer};
 
-pub(super) struct DeserializerState<'db, R> {
+pub(super) struct DeserializerState<'db, R, T: DecodeTarget> {
     /// The user-provided configuration that we should use.
     deserializer: &'db Deserializer<'db>,
 
     /// The input data encoded as a binary model.
     input: R,
 
-    /// The tree that instances should be written into. Eventually returned to
-    /// the user.
-    tree: WeakDom,
+    /// The destination that fully decoded instances are written into.
+    target: T,
 
     /// The metadata contained in the file, which affects how some constructs
     /// are interpreted by Roblox.
@@ -50,7 +49,7 @@ pub(super) struct DeserializerState<'db, R> {
     instance_key_by_ref: HashMap<i32, InstanceKey>,
 
     /// All of the instances known by the deserializer.
-    instances: Vec<Instance>,
+    instances: Vec<Instance<T::Instance>>,
 
     /// Referents for all of the instances with no parent, in order they appear
     /// in the file.
@@ -86,9 +85,9 @@ struct InstanceKey {
 /// Contains all the information we need to gather in order to construct an
 /// instance. Incrementally built up by the deserializer as we decode different
 /// chunks.
-struct Instance {
-    /// A work-in-progress builder that will be used to construct this instance.
-    builder: InstanceBuilder,
+struct Instance<I> {
+    /// A work-in-progress value populated by PROP chunks.
+    value: Option<I>,
 
     /// Document-defined IDs for the children of this instance.
     children: Vec<i32>,
@@ -179,20 +178,22 @@ fn find_canonical_property<'de>(
     }
 }
 
-fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty, value: Variant) {
+fn add_property<I: DecodeInstance>(
+    instance: &mut I,
+    canonical_property: &CanonicalProperty,
+    value: Variant,
+) {
     if let Some(PropertySerialization::Migrate(migration)) = canonical_property.migration {
         let old_property_name = canonical_property.name;
         match migration.perform(&value) {
             Ok(new_value) => {
                 for &new_property_name in migration.new_property_names() {
-                    if !instance.builder.has_property(new_property_name) {
+                    if !instance.has_property(new_property_name.into()) {
                         log::trace!(
-                                "Attempting to migrate property {old_property_name} to {new_property_name}"
-                            );
+                            "Attempting to migrate property {old_property_name} to {new_property_name}"
+                        );
 
-                        instance
-                            .builder
-                            .add_property(new_property_name, new_value.clone());
+                        instance.add_property(new_property_name.into(), new_value.clone());
                     }
                 }
             }
@@ -202,31 +203,28 @@ fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty,
             }
         };
     } else {
-        instance
-            .builder
-            .add_property(canonical_property.name, value)
+        instance.add_property(canonical_property.name, value)
     }
 }
 
-impl<'db, R: Read> DeserializerState<'db, R> {
+impl<'db, R: Read, T: DecodeTarget> DeserializerState<'db, R, T> {
     pub(super) fn new(
         deserializer: &'db Deserializer<'db>,
         mut input: R,
+        mut target: T,
     ) -> Result<Self, InnerError> {
-        let mut tree = WeakDom::new(InstanceBuilder::new("DataModel"));
-
         let header = FileHeader::decode(&mut input)?;
 
         let type_infos = HashMap::with_capacity(header.num_types as usize);
         let instance_key_by_ref = HashMap::with_capacity(1 + header.num_instances as usize);
         let instances = Vec::with_capacity(1 + header.num_instances as usize);
 
-        tree.reserve(header.num_instances as usize);
+        target.reserve(header.num_instances as usize);
 
         Ok(DeserializerState {
             deserializer,
             input,
-            tree,
+            target,
             metadata: HashMap::new(),
             shared_strings: Vec::new(),
             type_infos,
@@ -302,14 +300,13 @@ impl<'db, R: Read> DeserializerState<'db, R> {
 
         let start = self.instances.len();
         for (key, referent) in referents.enumerate() {
-            let builder =
-                InstanceBuilder::with_property_capacity(type_name.as_str(), prop_capacity);
+            let instance = T::Instance::new(type_name.as_str().into(), prop_capacity);
 
             let replaced_referent = self.instance_key_by_ref.insert(
                 referent,
                 InstanceKey {
                     key: start + key,
-                    referent: builder.referent(),
+                    referent: instance.referent(),
                 },
             );
 
@@ -319,7 +316,7 @@ impl<'db, R: Read> DeserializerState<'db, R> {
             };
 
             self.instances.push(Instance {
-                builder,
+                value: Some(instance),
                 children: Vec::new(),
             });
         }
@@ -416,7 +413,11 @@ This may cause unexpected or broken behavior in your final results if you rely o
                         String::from_utf8_lossy(binary_string.as_ref()).into_owned()
                     }
                 };
-                instance.builder.set_name(value);
+                instance
+                    .value
+                    .as_mut()
+                    .expect("instance was consumed before decoding finished")
+                    .set_name(value);
             }
 
             return Ok(());
@@ -434,6 +435,12 @@ This may cause unexpected or broken behavior in your final results if you rely o
         };
 
         let canonical_type = property.ty;
+        let instances = instances.iter_mut().map(|instance| {
+            instance
+                .value
+                .as_mut()
+                .expect("instance was consumed before decoding finished")
+        });
 
         match binary_type {
             Type::String => match canonical_type {
@@ -1513,7 +1520,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
     /// Combines together all the decoded information to build and emplace
     /// instances in our tree.
     #[profiling::function]
-    pub(super) fn finish(mut self) -> WeakDom {
+    pub(super) fn finish(mut self) -> T::Output {
         log::trace!("Constructing tree from deserialized data");
 
         // Track all the instances we need to construct. Order of construction
@@ -1522,33 +1529,31 @@ rbx-dom may require changes to fully support this property. Please open an issue
         let mut instances_to_construct = VecDeque::new();
 
         // Any instance with a parent of -1 will be at the top level of the
-        // tree. Because of the way rbx_dom_weak generally works, we need to
-        // start at the top of the tree to begin construction.
-        let root_ref = self.tree.root_ref();
+        // tree. Targets receive instances top-down so they can build parent
+        // links without retaining a second tree representation.
+        let root_ref = self.target.root_ref();
         for &referent in &self.root_instance_refs {
             instances_to_construct.push_back((referent, root_ref));
         }
 
-        // Ensure we hit the global ustr lock array only once
-        let empty_ustr = Ustr::default();
-
         while let Some((referent, parent_ref)) = instances_to_construct.pop_front() {
             // We need to drain the instances Vec in a random order without
-            // disturbing the indices. Replace each instance with an impostor!
-            // We guarantee this is done once by removing the key from `instance_key_by_ref`.
+            // disturbing the indices. We guarantee each value is taken once
+            // by removing its key from `instance_key_by_ref`.
             let instance_key = self.instance_key_by_ref.remove(&referent).unwrap().key;
-            let impostor = Instance {
-                builder: InstanceBuilder::new(empty_ustr),
-                children: Vec::new(),
-            };
-            let instance = core::mem::replace(&mut self.instances[instance_key], impostor);
-            let id = self.tree.insert(parent_ref, instance.builder);
+            let instance = &mut self.instances[instance_key];
+            let value = instance
+                .value
+                .take()
+                .expect("instance was constructed more than once");
+            let id = value.referent();
+            self.target.insert(parent_ref, value);
 
-            for referent in instance.children {
+            for referent in core::mem::take(&mut instance.children) {
                 instances_to_construct.push_back((referent, id));
             }
         }
 
-        self.tree
+        self.target.finish()
     }
 }
